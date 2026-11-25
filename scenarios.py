@@ -9,6 +9,7 @@ TICK_SECONDS = 0.25
 REGISTRY = "registry"
 BACKBONE = "backbone"
 MB = 1_000_000
+TOPOLOGIES = ("single-region", "multi-region")
 
 
 @dataclass(frozen=True)
@@ -74,7 +75,20 @@ def scaled_profiles(profiles, target_cpu, target_memory, cpu_range, memory_range
     ]
 
 
-def generate(seed, request_count, initial_cache_fraction, load_multiplier, bandwidth, calibration=None):
+def network_layout(topology, rng, bandwidth):
+    if topology == "single-region":
+        return [Link(REGISTRY, BACKBONE, 8, 2 * bandwidth)], (BACKBONE,) * 5
+    if topology != "multi-region":
+        raise ValueError(f"Unknown topology: {topology}")
+    regions = ("north", "central", "south")
+    links = [Link(REGISTRY, BACKBONE, 8, 3 * bandwidth)]
+    for region in regions:
+        links.append(Link(BACKBONE, region, rng.uniform(8, 20), bandwidth * rng.uniform(0.8, 1.2)))
+    return links, tuple(region for region in regions for _ in range(4))
+
+
+def generate(seed, request_count, initial_cache_fraction, load_multiplier, bandwidth, calibration=None,
+             topology="single-region"):
     rng = Random(seed)
     networks = Random(seed + 101)
     cache_rng = Random(seed + 203)
@@ -94,8 +108,8 @@ def generate(seed, request_count, initial_cache_fraction, load_multiplier, bandw
     catalog_bytes = sum(layers.values())
 
     servers = []
-    links = [Link(REGISTRY, BACKBONE, 8, 2 * bandwidth)]
-    for index in range(5):
+    links, site_parents = network_layout(topology, networks, bandwidth)
+    for index, parent in enumerate(site_parents):
         name = f"edge-{index}"
         cpu, memory = rng.choice(machines)
         storage = round(catalog_bytes * networks.uniform(0.75, 0.85))
@@ -107,7 +121,7 @@ def generate(seed, request_count, initial_cache_fraction, load_multiplier, bandw
                 cache.append(layer)
                 cached_bytes += layers[layer]
         servers.append(Server(name, cpu, memory, storage, tuple(cache)))
-        links.append(Link(BACKBONE, name, networks.uniform(3, 14), bandwidth * networks.uniform(0.6, 1.4)))
+        links.append(Link(parent, name, networks.uniform(3, 14), bandwidth * networks.uniform(0.6, 1.4)))
 
     image_ids = list(images)
     popularity = [1 / (rank + 1) ** 0.8 for rank in range(len(image_ids))]

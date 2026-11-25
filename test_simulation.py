@@ -2,7 +2,7 @@ import unittest
 from dataclasses import replace
 from random import Random
 
-from experiment import operating_region
+from experiment import operating_region, p95, paired_difference
 from policies import Candidate, Guardrails, POLICIES, WEIGHTS, adaptive_layer_score, choose
 from scenarios import MB, demo_scenario, generate
 from simulation import simulate
@@ -98,6 +98,28 @@ class ProvisioningTests(unittest.TestCase):
                               cached_bytes=20 * MB, cache_fraction=0.5, cpu_utilization=0.4)
         self.assertEqual(adaptive_layer_score(candidate), 1.5)
         self.assertEqual(adaptive_layer_score(replace(candidate, cpu_utilization=0.6)), 0.75)
+
+    def test_multiregion_topology_and_placements(self):
+        scenario = generate(401, 30, 0.45, 0.95, 35, topology="multi-region")
+        self.assertEqual(len(scenario.servers), 12)
+        self.assertEqual(len(scenario.links), 16)
+        for region in ("north", "central", "south"):
+            self.assertEqual(sum(link.left == region for link in scenario.links), 4)
+        for allowance in (8, 12):
+            results, _ = simulate(scenario, "guarded", guardrails=Guardrails(max_detour_ms=allowance))
+            ready = [row for row in results if row.ready_seconds is not None]
+            self.assertTrue(ready)
+            self.assertTrue(all(row.detour_ms <= allowance for row in ready))
+
+    def test_pairing_requires_matching_request_ids(self):
+        outcomes, _ = simulate(demo_scenario(), "nearest")
+        with self.assertRaisesRegex(ValueError, "Mismatched paired requests"):
+            paired_difference(outcomes, outcomes[::-1], {}, {})
+
+    def test_p95_uses_the_nearest_rank(self):
+        self.assertEqual(p95(range(1, 21)), 19)
+        self.assertEqual(p95([2]), 2)
+        self.assertIsNone(p95([]))
 
 
 if __name__ == "__main__":

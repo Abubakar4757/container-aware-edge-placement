@@ -1,4 +1,4 @@
-"""Run matched factorial experiments and export data for the report and demo."""
+"""Run matched factorial experiments and export reproducible results."""
 
 import argparse
 import csv
@@ -6,20 +6,29 @@ import gzip
 import itertools
 import json
 from dataclasses import asdict, replace
+from io import TextIOWrapper
+from math import ceil
 from pathlib import Path
 from random import Random
 from statistics import mean, median, quantiles
 
 from policies import Guardrails, LABELS, POLICIES, WEIGHTS
-from scenarios import MB, demo_scenario, generate
+from scenarios import MB, TOPOLOGIES, demo_scenario, generate
 from simulation import simulate
 from trace_data import calibrate, fetch
 
 METRICS = ("mean_provisioning_s", "download_mb_per_request", "mean_user_latency_ms",
-           "success_pct", "cpu_imbalance_cv", "mean_detour_ms", "max_detour_ms", "over_budget_pct")
+           "p95_user_latency_ms", "success_pct", "cpu_imbalance_cv", "mean_detour_ms",
+           "max_detour_ms", "over_budget_pct")
 COMPARISON_METRICS = (
-    "matched_provisioning_s", "download_mb_per_request", "matched_latency_ms", "success_pct",
+    "matched_provisioning_s", "download_mb_per_request", "matched_latency_ms",
+    "matched_p95_latency_ms", "success_pct",
 )
+
+
+def p95(values):
+    ordered = sorted(values)
+    return ordered[ceil(0.95 * len(ordered)) - 1] if ordered else None
 
 
 def summary(outcomes, imbalance, budget_ms):
@@ -36,6 +45,7 @@ def summary(outcomes, imbalance, budget_ms):
             - quantiles(times, n=4, method="inclusive")[0] if len(times) > 1 else None
         ),
         "mean_user_latency_ms": mean(row.user_latency_ms for row in ready) if ready else None,
+        "p95_user_latency_ms": p95(row.user_latency_ms for row in ready),
         "missing_mb_per_ready": mean(row.missing_bytes for row in ready) / MB if ready else None,
         "download_mb_per_request": sum(row.downloaded_bytes for row in outcomes) / MB / len(outcomes),
         "cpu_imbalance_cv": imbalance,
@@ -50,8 +60,12 @@ def summary(outcomes, imbalance, budget_ms):
 
 
 def paired_difference(outcomes, reference, run, baseline):
-    matched = [(left, right) for left, right in zip(outcomes, reference)
-               if left.ready_seconds is not None and right.ready_seconds is not None]
+    matched = []
+    for left, right in zip(outcomes, reference, strict=True):
+        if left.request_id != right.request_id:
+            raise ValueError(f"Mismatched paired requests: {left.request_id} and {right.request_id}")
+        if left.ready_seconds is not None and right.ready_seconds is not None:
+            matched.append((left, right))
     return {
         "common_ready": len(matched),
         "matched_provisioning_s": (
@@ -60,6 +74,10 @@ def paired_difference(outcomes, reference, run, baseline):
         ),
         "matched_latency_ms": (
             mean(left.user_latency_ms - right.user_latency_ms for left, right in matched)
+            if matched else None
+        ),
+        "matched_p95_latency_ms": (
+            p95(left.user_latency_ms for left, _ in matched) - p95(right.user_latency_ms for _, right in matched)
             if matched else None
         ),
         "download_mb_per_request": run["download_mb_per_request"] - baseline["download_mb_per_request"],
@@ -112,29 +130,39 @@ def run_experiments(config, output, calibration, limit, pilot=False):
     output.mkdir(parents=True, exist_ok=True)
     cells = list(itertools.product(config["cache_fractions"], config["load_multipliers"],
                                    config["backhaul_mbps"]))
+    weight_cells = {tuple(cell) for cell in config["weight_sensitivity"]}
     if pilot:
-        cells = [tuple(cell) for cell in config["weight_sensitivity"]]
+        cells = [cell for cell in cells if cell in weight_cells]
+        if not cells:
+            raise ValueError("Define at least one weight-sensitivity cell to run the pilot")
         seeds = (1, 2, 3)
     else:
         start = config["seed_start"]
         seeds = range(start, start + (limit or config["seed_count"]))
     counts = config["requests_per_run"]
+    topology = config.get("topology", "single-region")
+    guard_cells = set(cells) if config.get("guard_sensitivity_all") else weight_cells
     default_guardrails = Guardrails(**config["guardrails"])
     budget_variants = {f"detour-{budget:g}ms": budget for budget in config["guard_sensitivity_ms"]}
     run_rows, pair_rows = [], []
-    with gzip.open(output / "requests.csv.gz", "wt", encoding="utf-8", newline="") as stream:
+    with (output / "requests.csv.gz").open("wb") as compressed, TextIOWrapper(
+        gzip.GzipFile(filename="", fileobj=compressed, mode="wb", mtime=0),
+        encoding="utf-8", newline="",
+    ) as stream:
         request_writer = None
         for cache, load, network in cells:
             for seed in seeds:
+                factors = (cache, load, network)
                 scenario = generate(seed, counts, config["cache_fractions"][cache],
                                     config["load_multipliers"][load], config["backhaul_mbps"][network],
-                                    calibration)
+                                    calibration, topology)
                 cell = {"cache": cache, "load": load, "network": network, "seed": seed,
                         "initial_byte_coverage": scenario.byte_coverage()}
                 variants = [(policy, "balanced") for policy in POLICIES]
                 variants.append(("combined", "queue-blind"))
-                if [cache, load, network] in config["weight_sensitivity"]:
+                if factors in weight_cells:
                     variants.extend(("combined", weight) for weight in WEIGHTS if weight != "balanced")
+                if factors in guard_cells:
                     variants.extend(("guarded", label) for label in budget_variants)
                 runs = {}
                 for policy, variant in variants:
@@ -181,6 +209,9 @@ def run_experiments(config, output, calibration, limit, pilot=False):
     write_rows(output / "paired.csv", pair_rows)
     result = {
         "source": calibration["source"] if calibration else "synthetic resources",
+        "topology": topology,
+        "edge_sites": len(scenario.servers),
+        "network_links": len(scenario.links),
         "run_count": len(run_rows), "seeds": list(seeds), "cells": len(cells),
         "requests_per_run": counts,
         "guardrails": config["guardrails"],
@@ -236,8 +267,32 @@ def run_experiments(config, output, calibration, limit, pilot=False):
                     "metrics": intervals([
                         row for row in pair_rows if row["policy"] == "guarded"
                         and row["weights"] == label and row["reference"] == "nearest"
-                        and [row["cache"], row["load"], row["network"]] in config["weight_sensitivity"]
+                        and (row["cache"], row["load"], row["network"]) in guard_cells
                     ], COMPARISON_METRICS),
+                }
+                for label, budget in {"balanced": default_guardrails.max_detour_ms, **budget_variants}.items()
+            },
+            "by_budget": {
+                label: {
+                    "budget_ms": budget,
+                    "ready_placements": sum(row["ready"] for row in run_rows
+                                            if row["policy"] == "guarded" and row["weights"] == label),
+                    "worst_observed_detour_ms": max(
+                        (row["max_detour_ms"] or 0 for row in run_rows
+                         if row["policy"] == "guarded" and row["weights"] == label), default=0
+                    ),
+                    "paired": {
+                        reference: intervals([
+                            row for row in pair_rows if row["policy"] == "guarded"
+                            and row["weights"] == label and row["reference"] == reference
+                            and (row["cache"], row["load"], row["network"]) in guard_cells
+                        ], COMPARISON_METRICS)
+                        for reference in ("nearest", "adaptive-layer", "combined")
+                    },
+                    "metrics": intervals([
+                        row for row in run_rows if row["policy"] == "guarded" and row["weights"] == label
+                        and (row["cache"], row["load"], row["network"]) in guard_cells
+                    ], METRICS),
                 }
                 for label, budget in {"balanced": default_guardrails.max_detour_ms, **budget_variants}.items()
             },
@@ -265,7 +320,7 @@ def run_experiments(config, output, calibration, limit, pilot=False):
             variant: intervals([
                 row for row in pair_rows if row["policy"] == "combined" and row["weights"] == variant
                 and row["reference"] == "layer-aware"
-                and [row["cache"], row["load"], row["network"]] in config["weight_sensitivity"]
+                and (row["cache"], row["load"], row["network"]) in weight_cells
             ], COMPARISON_METRICS)
             for variant in WEIGHTS
         },
@@ -303,13 +358,14 @@ def demo(guardrails):
 def compare(path):
     data = json.loads(path.read_text(encoding="utf-8"))
     print(f"{data['run_count']} runs | {data['cells']} conditions | {data['source']}")
-    print(f"{'Policy':29s} {'Ready %':>8s} {'Startup s':>10s} {'Path ms':>9s} {'Over cap %':>11s}")
+    print(f"{data['topology']} | {data['edge_sites']} edge sites | {data['network_links']} links")
+    print(f"{'Policy':29s} {'Ready %':>8s} {'Startup s':>10s} {'Path ms':>9s} {'p95 ms':>8s} {'Over cap %':>11s}")
     for policy, values in data["policies"].items():
         stats = [values[key]["mean"] for key in ("success_pct", "mean_provisioning_s",
-                                                "mean_user_latency_ms", "over_budget_pct")]
+                                                "mean_user_latency_ms", "p95_user_latency_ms", "over_budget_pct")]
         print(f"{LABELS[policy]:29s} " + " ".join(
             f"{value:>{width}.2f}" if value is not None else f"{'n/a':>{width}s}"
-            for value, width in zip(stats, (8, 10, 9, 11))
+            for value, width in zip(stats, (8, 10, 9, 8, 11))
         ))
     guard = data["guarded"]
     print(f"\nGuarded max observed detour: {guard['worst_observed_detour_ms']:.3f} ms "
@@ -319,6 +375,14 @@ def compare(path):
         if value["low"] is not None:
             print(f"Guarded - {LABELS[reference]} startup: {value['mean']:+.2f} s "
                   f"[{value['low']:+.2f}, {value['high']:+.2f}], paired 95% interval")
+    print("\nGuarded allowance sweep, relative to Nearest Feasible:")
+    for variant in sorted(guard["by_budget"].values(), key=lambda item: item["budget_ms"]):
+        metrics = variant["paired"]["nearest"]
+        startup = metrics["matched_provisioning_s"]["mean"]
+        latency = metrics["matched_p95_latency_ms"]["mean"]
+        if startup is not None and latency is not None:
+            print(f"  {variant['budget_ms']:g} ms: {startup:+.2f} s matched startup, "
+                  f"{latency:+.2f} ms matched p95 path latency")
 
 
 def main():
@@ -360,6 +424,8 @@ def main():
         config = json.loads(args.config.read_text(encoding="utf-8"))
         if args.seeds is not None and args.seeds < 1:
             parser.error("--seeds must be positive")
+        if config.get("topology", "single-region") not in TOPOLOGIES:
+            parser.error(f"topology must be one of {', '.join(TOPOLOGIES)}")
         calibration = json.loads(args.calibration.read_text(encoding="utf-8")) if args.calibration else None
         run_experiments(config, args.output, calibration, args.seeds, args.pilot)
 
