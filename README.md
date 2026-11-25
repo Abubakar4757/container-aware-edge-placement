@@ -1,87 +1,65 @@
 # Container-Aware Service Placement at the Edge
 
-An EdgeSimPy implementation of online container placement with reproducible benchmarks. Alibaba Cluster Trace v2018 provides joint CPU and memory profiles. Image layers, caches, topology, arrivals, and bandwidth are generated from fixed seeds.
+An online container-placement simulator built with Python and EdgeSimPy 1.1.0. Read [OVERVIEW.md](OVERVIEW.md) for the handoff summary and final comparisons. [EdgeSimPy paper](https://doi.org/10.1016/j.future.2023.06.013)
 
-## Scheduler
+## Run the project
 
-**Latency-Guarded Queue-Aware** placement adds a per-request latency cap and download queue awareness to layer-based placement:
+Use **Python 3.10 or 3.12** and Git. The published trace-calibrated runs were generated using 3.12. The tests and the one-seed synthetic workflow also ran under 3.10. Create a virtual environment and install the pinned dependencies:
 
-1. Filter servers by available CPU, memory, and storage, including disk already reserved for scheduled downloads.
-2. Find the feasible server with the shortest one-way user path.
-3. Consider alternative servers only when they are within **8 ms** of that path and have at least **0.25 s** lower estimated pull time. The estimate includes queued bytes, active-transfer bytes, and newly required bytes without double-counting shared transfers.
-4. Rank the remaining servers using the combined score for pull time, user latency, and resource pressure. The closest feasible server remains eligible throughout.
-
-The latency cap applies relative to the nearest server that can admit that request at decision time. Path latency measures simulated network propagation. Provisioning time is measured separately by the simulator after placement.
-
-The controls include Nearest Feasible, the same combined score without the latency guard, and an LRScheduler-inspired baseline. The latter implements the published adaptive layer weights and thresholds with a CPU/memory LeastAllocated score in place of the Kubernetes plugin stack. This makes the comparison specific to the common simulation environment. [Tang et al., LRScheduler, Sections III–VI](https://arxiv.org/html/2506.03694v1)
-
-## Verified single-region benchmark
-
-- **2,160 runs and 216,000 request records.** The default 8 ms cap held for all 11,888 ready placements made by the guarded policy. Its maximum observed detour was 7.97 ms.
-- **Compared with the LRScheduler-inspired baseline**, the guarded policy reduced user-path latency by 6.29 ms on jointly served requests, added 3.91 s of provisioning time, and reduced placement success by 3.11 percentage points.
-- **Compared with Nearest Feasible**, the default guarded policy saved an estimated 0.70 s of provisioning time overall. The 95% interval includes zero. In the three-condition sensitivity sweep, a 12 ms cap saved 3.01 s on average with a 95% interval of 0.11 to 5.98 s saved.
-
-## Verified multi-region benchmark
-
-The follow-up adds **2,160 runs and 432,000 request records** across 12 sites and three regions. Both guarded variants enforced their respective caps on every ready placement: **21,388** under the 8 ms cap and **21,615** under the 12 ms cap.
-
-| Policy | Mean provisioning | Mean run p95 user path | Placement success |
-| --- | ---: | ---: | ---: |
-| LRScheduler-inspired | 61.89 s | 52.32 ms | 54.79% |
-| Nearest Feasible | 72.67 s | 46.39 ms | 48.86% |
-| Combined, without guard | 44.18 s | 50.04 ms | 56.70% |
-| Latency-Guarded, 8 ms | 70.18 s | 46.91 ms | 49.51% |
-| Latency-Guarded, 12 ms | 65.89 s | 46.78 ms | 50.03% |
-
-On jointly served requests, the 12 ms variant saved **6.94 s** versus Nearest Feasible (95% interval: 4.07–9.70 s saved). Its paired p95 user-path change was **+0.31 ms** (95% interval: −0.61 to +1.22 ms), and placement success rose **1.17 percentage points**. Against the LRScheduler-inspired baseline, the same variant reduced paired p95 by **6.75 ms**, with **6.82 s** longer provisioning and **4.75 percentage points** lower success. These differences describe the simulated workload and network.
-
-## Run locally
-
-Use Python 3.12 and Git. On Windows, in PowerShell:
-
-```powershell
+```text
 python -m venv .venv
-$python = './.venv/Scripts/python.exe'
-& $python -m pip install -r requirements.txt
-& $python -m unittest -v
-& $python experiment.py demo
-& $python experiment.py demo --latency-budget-ms 24
-& $python experiment.py compare
-& $python experiment.py compare --summary results/multiregion/summary.json
-& $python verify_results.py
 ```
 
-On macOS or Linux, use `.venv/bin/python`. After setup, the demo, tests, and comparison command run offline. In the demo, the near server has a 2 ms user path and a 20 MB cold image. The warm server has a 25 ms path. At an 8 ms detour budget, the guard chooses near. At 24 ms it can choose the warm server, and the CLI shows the actual wait, transfer volume, and detour. The fixture also demonstrates a shared in-flight download and a capacity rejection.
+| Platform | Install dependencies | Run the demo, tests, and saved-result audit |
+| --- | --- | --- |
+| macOS or Linux | `.venv/bin/python -m pip install -r requirements.txt` | `.venv/bin/python run_project.py` |
+| Windows PowerShell | `.\.venv\Scripts\python.exe -m pip install -r requirements.txt` | `.\.venv\Scripts\python.exe run_project.py` |
 
-## Reproduce the benchmarks
+With the virtual environment active, run `python experiment.py demo` for the live demonstration. The near server has a 2 ms user path and a 20 MB cold image. The warm server has a 25 ms path. The guarded policy chooses near under its default 8 ms allowance. Try `python experiment.py demo --latency-budget-ms 24` to allow the warm server. The fixture also shows a shared in-flight download and a capacity rejection.
 
-```powershell
-& $python experiment.py fetch
-& $python experiment.py calibrate
-& $python experiment.py run --calibration data/derived/calibration.json --output runs/single-region
-& $python experiment.py run --config experiment.multiregion.json --calibration data/derived/calibration.json --output runs/multi-region
-& $python verify_results.py runs/single-region runs/multi-region
-& $python plot_results.py --summary runs/multi-region/summary.json --output runs/multi-region/benchmark.png
+## Reproduce both benchmarks
+
+With the environment active:
+
+```text
+python run_project.py --full
 ```
 
-The fetch command retrieves only `machine_meta.tar.gz` and `container_meta.tar.gz`, then checks their published SHA-256 values. If the mirror is unavailable, put the official archives in `data/raw/` and run calibration. Calibration also accepts the two extracted CSV files when the archives are absent. Raw data and derived trace profiles stay local. [Alibaba trace documentation](https://github.com/alibaba/clusterdata/blob/master/cluster-trace-v2018/trace_2018.md)
+The command downloads and verifies the two Alibaba metadata archives, preprocesses them, runs both factorial benchmarks, checks the outputs, and generates the figures under `runs/reproduction/`. For an offline smoke experiment, use `python run_project.py --full --synthetic --seeds 1`. The default demo and audit work offline after dependencies are installed.
 
-For a quick trace-free check, run `experiment.py run --synthetic --seeds 1 --output runs/smoke`.
+Only `machine_meta.tar.gz` and `container_meta.tar.gz` are needed. The downloader checks the published SHA-256 hashes. If the mirror is unavailable, place the official archives in `data/raw/`. Extracted CSVs are accepted by `python experiment.py calibrate` when the archives are absent. See [Alibaba’s trace documentation](https://github.com/alibaba/clusterdata/blob/master/cluster-trace-v2018/trace_2018.md).
 
-Both benchmarks cross three initial cache levels, three workload levels, and two nominal bandwidth levels (35 and 160 Mb/s). Policies within each scenario see the same workload and initial state.
+## Policy and comparison
 
-- **Single-region.** Five sites share one backbone. Each policy sees 100 requests per scenario. Seeds are 101–112. The 0, 4, 8, 12, and 24 ms allowances are compared in three selected conditions.
-- **Multi-region.** Twelve sites are split across three regions. Each region has a shared uplink and all three use the same registry link. Each policy sees 200 requests per scenario, with fresh seeds 401–412. The 8 and 12 ms allowances are compared across all 18 conditions. This evaluates behavior under a change in network structure and workload scale.
+The guarded policy filters servers by CPU, memory, and incremental storage. An alternative to the nearest feasible server must stay within the configured extra one-way user-path allowance and offer at least 0.25 s of estimated pull savings. Among the remaining candidates, Combined and Guarded score pull time, path latency, and resource pressure. Pull time is divided by a fixed 4 s reference and user latency by a fixed 20 ms reference. Resource pressure is already a fraction. Fixed references keep the score comparable across environments and do not bound the terms to a maximum of 1.
 
-Paired provisioning and user-path comparisons use requests that reached readiness under both policies. Transfer and placement success use all submitted requests. The p95 in the policy summary is the mean of scenario-level nearest-rank p95 latencies. The paired p95 delta subtracts each baseline's p95 from the guarded policy's p95 on the jointly served requests within each scenario. Confidence intervals resample seeds while preserving their matched conditions.
+The pull estimate sums local bytes queued, remaining bytes in active transfers, and bytes from newly required layers. It counts a shared in-flight layer once. The estimate divides this backlog by the uncongested route bottleneck rate. Actual transfer progress and contention are simulated by EdgeSimPy. The score estimates local backlog and does not forecast other sites’ future arrivals.
+
+The **Layer-Aware + Queue** baseline ranks candidates by that same pull estimate. It helps isolate the value of Combined’s latency and resource terms. The queue-ablation experiment holds Combined’s weights fixed and replaces the backlog numerator with image-missing bytes. The **LRScheduler-inspired** comparison uses the weights and thresholds reported in Section VI-A (2.0 and 0.5, 10 MB cached, 0.60 CPU utilization, 0.16 skew), with CPU/memory LeastAllocated as the simulator’s resource score. [Tang et al., LRScheduler](https://arxiv.org/html/2506.03694v1)
+
+The contribution is a comparative study of a local-backlog estimate and a hard, per-request latency rule in an online placement model. Gu et al. already exploit shared image layers. Lou et al. jointly optimize container assignment and layer download order, and their later startup-aware work accounts for bandwidth contention while scheduling dependent tasks. These works motivate the design and put the contribution in context. [Gu et al., 2021](https://doi.org/10.1109/INFOCOM42981.2021.9488779) · [Lou et al., 2023](https://doi.org/10.1109/TSC.2022.3159728) · [Lou et al., 2024](https://doi.org/10.1109/TMC.2023.3238868)
+
+## Experimental assumptions
+
+- **Calibration.** The Alibaba metadata provide the shape and pairing of CPU and normalized memory observations. The preprocessor retains the earliest valid declaration per entity, yielding 4,034 machine and 71,474 container profiles. The simulator rescales them to chosen medians of 8 cores and 16 model memory units per site, and 2 cores and 3 model memory units per service, with clipping at fixed bounds. Model memory units are synthetic and Alibaba’s normalized field supplies no physical RAM measurement. The trace supplies resource profiles only. [Alibaba trace schema](https://github.com/alibaba/clusterdata/blob/master/cluster-trace-v2018/schema.txt)
+- **Images and network.** Each synthetic image contains two shared layers of 15–75 MB and one private layer of 8–65 MB, giving a 38–215 MB full image range. Nominal bandwidth is 35 or 160 Mb/s to produce contrasting transfer regimes. For scale, a 38–215 MB image on a 35 Mb/s link would take roughly 9–49 s to transfer at full link rate. The 2 ms local hop, 3–14 ms site links, and 8–20 ms inter-region uplinks are chosen propagation settings. Measured container-startup studies motivate varying image transfer cost, while the particular parameter ranges here define synthetic scenarios. [Harter et al., FAST 2016](https://www.usenix.org/conference/fast16/technical-sessions/presentation/harter)
+- **Offered load.** The nominal 0.20×, 0.55×, 0.95×, and 1.45× levels scale arrival rates relative to a capacity estimate with a 12 s nominal post-ready lifetime. CPU and memory are reserved while a service provisions, so these multipliers do not predict utilization. Report measured CPU and memory occupancy, including the split between provisioning and ready-service reservations, over the same arrival window for every policy.
+- **Design.** Both benchmarks cross three initial cache levels, four offered-load levels, and two bandwidths (24 cells each), with 12 seeds per cell. The five-site single region uses 100 requests per run. The 12-site, three-region topology uses 200 requests and a separate seed range. The 8 and 12 ms guarded variants run across all multi-region cells. Five weight settings for Combined and Guarded are evaluated in four chosen conditions in each topology.
+- **Metrics.** Provisioning and path latency comparisons use jointly served requests. The 10, 30, and 60 s readiness rates divide by all submitted requests, counting rejections and late requests as misses. The p95 uses nearest rank per run. Paired p95 differences compare each policy’s p95 on the common ready subset. Confidence intervals resample seed blocks and preserve their matched cells.
+- **Scope.** Caches retain layers throughout a run, with storage capacity as a hard constraint. The simulator uses static user locations and reliable links. Path latency represents propagation. The reported reservation fractions describe modeled capacity occupancy.
+
+## Results and figures
 
 | Output | Single-region | Multi-region |
 | --- | --- | --- |
 | Configuration | [JSON](experiment.json) | [JSON](experiment.multiregion.json) |
-| Benchmark plot | [PNG](results/benchmark.png) | [PNG](results/multiregion/benchmark.png) |
 | Summary | [JSON](results/summary.json) | [JSON](results/multiregion/summary.json) |
 | Per-run metrics | [CSV](results/runs.csv) | [CSV](results/multiregion/runs.csv) |
 | Paired comparisons | [CSV](results/paired.csv) | [CSV](results/multiregion/paired.csv) |
-| Request traces | [CSV.GZ](results/requests.csv.gz) | [CSV.GZ](results/multiregion/requests.csv.gz) |
+| Request-level data | [CSV.GZ](results/requests.csv.gz) | [CSV.GZ](results/multiregion/requests.csv.gz) |
 
-The verifier recomputes run metrics and paired differences from the request logs and checks request alignment, rejection accounting, and latency caps on both configurations.
+- [RQ1 and RQ4 — Cache × bandwidth heatmap](results/figures/cache-bandwidth-heatmap.png)
+- [RQ2 — Success and CPU occupancy versus offered load](results/figures/success-vs-offered-load.png)
+- [RQ3 — User-path latency versus provisioning time for all policies](results/figures/latency-vs-provisioning.png)
+
+The verifier reconciles both log sets against run metrics and paired statistics, verifies matched input requests and cap enforcement, and reconstructs resource occupancy and deadline readiness from request records. The source code is distributed under the [GNU GPL v3](LICENSE).

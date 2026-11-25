@@ -12,23 +12,55 @@ from pathlib import Path
 from random import Random
 from statistics import mean, median, quantiles
 
-from policies import Guardrails, LABELS, POLICIES, WEIGHTS
-from scenarios import MB, TOPOLOGIES, demo_scenario, generate
+from policies import Guardrails, LABELS, PATH_SCALE_MS, POLICIES, PULL_SCALE_SECONDS, WEIGHTS
+from scenarios import MB, TICK_SECONDS, TOPOLOGIES, demo_scenario, generate
 from simulation import simulate
 from trace_data import calibrate, fetch
 
+DEADLINES_SECONDS = (10, 30, 60)
+DEADLINE_METRICS = tuple(f"ready_by_{seconds}s_pct" for seconds in DEADLINES_SECONDS)
+UTILIZATION_METRICS = (
+    "cpu_reserved_pct", "cpu_provisioning_pct", "cpu_ready_pct",
+    "memory_reserved_pct", "memory_provisioning_pct", "memory_ready_pct",
+)
 METRICS = ("mean_provisioning_s", "download_mb_per_request", "mean_user_latency_ms",
            "p95_user_latency_ms", "success_pct", "cpu_imbalance_cv", "mean_detour_ms",
-           "max_detour_ms", "over_budget_pct")
+           "max_detour_ms", "over_budget_pct", *DEADLINE_METRICS, *UTILIZATION_METRICS)
 COMPARISON_METRICS = (
     "matched_provisioning_s", "download_mb_per_request", "matched_latency_ms",
-    "matched_p95_latency_ms", "success_pct",
+    "matched_p95_latency_ms", "success_pct", *DEADLINE_METRICS,
 )
 
 
 def p95(values):
     ordered = sorted(values)
     return ordered[ceil(0.95 * len(ordered)) - 1] if ordered else None
+
+
+def resource_occupancy(requests, outcomes, cpu_capacity, memory_capacity):
+    """Integrate resource reservations over the common arrival window."""
+    window = (requests[-1].arrival_tick + 1) * TICK_SECONDS
+    provisioning_cpu = ready_cpu = provisioning_memory = ready_memory = 0.0
+    for request, row in zip(requests, outcomes, strict=True):
+        if row.ready_seconds is None:
+            continue
+        provisioning = min(row.ready_seconds, window) - row.request_seconds
+        ready_time = max(0, min(row.ready_seconds + request.lifetime_ticks * TICK_SECONDS, window)
+                         - row.ready_seconds)
+        provisioning_cpu += request.cpu * provisioning
+        ready_cpu += request.cpu * ready_time
+        provisioning_memory += request.memory * provisioning
+        ready_memory += request.memory * ready_time
+    cpu_scale = 100 / (window * cpu_capacity)
+    memory_scale = 100 / (window * memory_capacity)
+    return {
+        "cpu_reserved_pct": (provisioning_cpu + ready_cpu) * cpu_scale,
+        "cpu_provisioning_pct": provisioning_cpu * cpu_scale,
+        "cpu_ready_pct": ready_cpu * cpu_scale,
+        "memory_reserved_pct": (provisioning_memory + ready_memory) * memory_scale,
+        "memory_provisioning_pct": provisioning_memory * memory_scale,
+        "memory_ready_pct": ready_memory * memory_scale,
+    }
 
 
 def summary(outcomes, imbalance, budget_ms):
@@ -38,6 +70,8 @@ def summary(outcomes, imbalance, budget_ms):
         "requests": len(outcomes),
         "ready": len(ready),
         "success_pct": len(ready) / len(outcomes) * 100,
+        **{metric: 100 * sum(time <= deadline for time in times) / len(outcomes)
+           for deadline, metric in zip(DEADLINES_SECONDS, DEADLINE_METRICS)},
         "mean_provisioning_s": mean(times) if times else None,
         "median_provisioning_s": median(times) if times else None,
         "iqr_provisioning_s": (
@@ -82,6 +116,7 @@ def paired_difference(outcomes, reference, run, baseline):
         ),
         "download_mb_per_request": run["download_mb_per_request"] - baseline["download_mb_per_request"],
         "success_pct": run["success_pct"] - baseline["success_pct"],
+        **{metric: run[metric] - baseline[metric] for metric in DEADLINE_METRICS},
     }
 
 
@@ -157,11 +192,16 @@ def run_experiments(config, output, calibration, limit, pilot=False):
                                     config["load_multipliers"][load], config["backhaul_mbps"][network],
                                     calibration, topology)
                 cell = {"cache": cache, "load": load, "network": network, "seed": seed,
-                        "initial_byte_coverage": scenario.byte_coverage()}
+                        "offered_load": config["load_multipliers"][load],
+                        "nominal_bandwidth_mbps": config["backhaul_mbps"][network],
+                        "initial_byte_coverage": scenario.byte_coverage(),
+                        "total_cpu_cores": sum(server.cpu for server in scenario.servers),
+                        "total_model_memory": sum(server.memory for server in scenario.servers)}
                 variants = [(policy, "balanced") for policy in POLICIES]
                 variants.append(("combined", "queue-blind"))
                 if factors in weight_cells:
-                    variants.extend(("combined", weight) for weight in WEIGHTS if weight != "balanced")
+                    variants.extend((policy, weight) for policy in ("combined", "guarded")
+                                    for weight in WEIGHTS if weight != "balanced")
                 if factors in guard_cells:
                     variants.extend(("guarded", label) for label in budget_variants)
                 runs = {}
@@ -173,13 +213,16 @@ def run_experiments(config, output, calibration, limit, pilot=False):
                                                    WEIGHTS.get(variant, WEIGHTS["balanced"]),
                                                    use_queue=variant != "queue-blind", guardrails=limits)
                     metrics = summary(outcomes, imbalance, limits.max_detour_ms)
+                    metrics.update(resource_occupancy(scenario.requests, outcomes, cell["total_cpu_cores"],
+                                                      cell["total_model_memory"]))
                     if policy == "guarded" and metrics["over_budget_pct"]:
                         raise RuntimeError(f"Latency guard violated for {cell}, {variant}")
                     runs[(policy, variant)] = (outcomes, metrics)
                     keys = {**cell, "policy": policy, "weights": variant, "detour_budget_ms": limits.max_detour_ms}
                     run_rows.append({**keys, **metrics})
-                    for outcome in outcomes:
-                        row = {**keys, **asdict(outcome)}
+                    for request, outcome in zip(scenario.requests, outcomes, strict=True):
+                        row = {**keys, "request_cpu_cores": request.cpu, "request_model_memory": request.memory,
+                               "service_lifetime_s": request.lifetime_ticks * TICK_SECONDS, **asdict(outcome)}
                         if request_writer is None:
                             request_writer = csv.DictWriter(stream, fieldnames=list(row))
                             request_writer.writeheader()
@@ -189,8 +232,9 @@ def run_experiments(config, output, calibration, limit, pilot=False):
                         continue
                     outcomes, metrics = runs[(policy, variant)]
                     references = {
-                        "combined": ("layer-aware", "best-fit"),
-                        "guarded": ("nearest", "combined", "adaptive-layer", "best-fit"),
+                        "combined": ("layer-aware", "layer-queue", "best-fit"),
+                        "layer-queue": ("layer-aware", "best-fit"),
+                        "guarded": ("nearest", "combined", "adaptive-layer", "layer-queue", "best-fit"),
                     }.get(policy, ("best-fit",))
                     for reference in references:
                         reference_outcomes, reference_metrics = runs[(reference, "balanced")]
@@ -214,6 +258,10 @@ def run_experiments(config, output, calibration, limit, pilot=False):
         "network_links": len(scenario.links),
         "run_count": len(run_rows), "seeds": list(seeds), "cells": len(cells),
         "requests_per_run": counts,
+        "offered_load_multipliers": config["load_multipliers"],
+        "ready_deadlines_s": DEADLINES_SECONDS,
+        "score_settings": {"pull_scale_s": PULL_SCALE_SECONDS, "path_scale_ms": PATH_SCALE_MS,
+                           "weights": WEIGHTS},
         "guardrails": config["guardrails"],
         "trace_summary": ({key: calibration[key] for key in
                            ("machine_summary", "container_summary", "application_groups")}
@@ -231,6 +279,15 @@ def run_experiments(config, output, calibration, limit, pilot=False):
             }
             for load in dict.fromkeys(load for _, load, _ in cells)
         },
+        "load_profile": {
+            load: {
+                policy: intervals([row for row in run_rows if row["load"] == load
+                                   and row["policy"] == policy and row["weights"] == "balanced"],
+                                  ("success_pct", *DEADLINE_METRICS, *UTILIZATION_METRICS))
+                for policy in POLICIES
+            }
+            for load in dict.fromkeys(load for _, load, _ in cells)
+        },
         "paired": {
             policy: intervals([row for row in pair_rows if row["policy"] == policy and row["weights"] == "balanced"
                                and row["reference"] == ("layer-aware" if policy == "combined" else "best-fit")],
@@ -239,6 +296,10 @@ def run_experiments(config, output, calibration, limit, pilot=False):
         },
         "queue_ablation": intervals([row for row in pair_rows if row["reference"] == "queue-blind"],
                                    COMPARISON_METRICS),
+        "combined_vs_layer_queue": intervals([
+            row for row in pair_rows if row["policy"] == "combined" and row["weights"] == "balanced"
+            and row["reference"] == "layer-queue"
+        ], COMPARISON_METRICS),
         "guarded": {
             "worst_observed_detour_ms": max(
                 row["max_detour_ms"] or 0 for row in run_rows
@@ -249,7 +310,7 @@ def run_experiments(config, output, calibration, limit, pilot=False):
                     row for row in pair_rows if row["policy"] == "guarded" and row["weights"] == "balanced"
                     and row["reference"] == reference
                 ], COMPARISON_METRICS)
-                for reference in ("nearest", "combined", "adaptive-layer", "best-fit")
+                for reference in ("nearest", "combined", "adaptive-layer", "layer-queue", "best-fit")
             },
             "paired_by_network": {
                 network: {
@@ -317,12 +378,15 @@ def run_experiments(config, output, calibration, limit, pilot=False):
             for cache in config["cache_fractions"] if any(cell[0] == cache for cell in cells)
         },
         "weight_sensitivity": {
-            variant: intervals([
-                row for row in pair_rows if row["policy"] == "combined" and row["weights"] == variant
-                and row["reference"] == "layer-aware"
-                and (row["cache"], row["load"], row["network"]) in weight_cells
-            ], COMPARISON_METRICS)
-            for variant in WEIGHTS
+            policy: {
+                variant: intervals([
+                    row for row in pair_rows if row["policy"] == policy and row["weights"] == variant
+                    and row["reference"] == reference
+                    and (row["cache"], row["load"], row["network"]) in weight_cells
+                ], COMPARISON_METRICS)
+                for variant in WEIGHTS
+            }
+            for policy, reference in (("combined", "layer-queue"), ("guarded", "nearest"))
         },
     }
     for cache, load, network in cells:
@@ -359,13 +423,15 @@ def compare(path):
     data = json.loads(path.read_text(encoding="utf-8"))
     print(f"{data['run_count']} runs | {data['cells']} conditions | {data['source']}")
     print(f"{data['topology']} | {data['edge_sites']} edge sites | {data['network_links']} links")
-    print(f"{'Policy':29s} {'Ready %':>8s} {'Startup s':>10s} {'Path ms':>9s} {'p95 ms':>8s} {'Over cap %':>11s}")
+    print(f"{'Policy':29s} {'Ready %':>8s} {'By 30s %':>9s} {'Startup s':>10s} "
+          f"{'Path ms':>9s} {'p95 ms':>8s} {'CPU held %':>11s} {'Over cap %':>11s}")
     for policy, values in data["policies"].items():
-        stats = [values[key]["mean"] for key in ("success_pct", "mean_provisioning_s",
-                                                "mean_user_latency_ms", "p95_user_latency_ms", "over_budget_pct")]
+        stats = [values[key]["mean"] for key in ("success_pct", "ready_by_30s_pct", "mean_provisioning_s",
+                                                "mean_user_latency_ms", "p95_user_latency_ms",
+                                                "cpu_reserved_pct", "over_budget_pct")]
         print(f"{LABELS[policy]:29s} " + " ".join(
             f"{value:>{width}.2f}" if value is not None else f"{'n/a':>{width}s}"
-            for value, width in zip(stats, (8, 10, 9, 8, 11))
+            for value, width in zip(stats, (8, 9, 10, 9, 8, 11, 11))
         ))
     guard = data["guarded"]
     print(f"\nGuarded max observed detour: {guard['worst_observed_detour_ms']:.3f} ms "

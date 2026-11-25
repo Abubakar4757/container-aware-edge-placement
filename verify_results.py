@@ -10,8 +10,9 @@ from math import ceil, isclose
 from pathlib import Path
 from statistics import mean, median, quantiles
 
-from experiment import COMPARISON_METRICS, METRICS, intervals
+from experiment import COMPARISON_METRICS, DEADLINE_METRICS, DEADLINES_SECONDS, METRICS, intervals
 from policies import POLICIES
+from scenarios import TICK_SECONDS
 
 FACTORS = ("cache", "load", "network", "seed")
 
@@ -59,10 +60,13 @@ def verify_run(rows, run, count):
     rejected = Counter()
     download_bytes = 0
     violations = 0
+    window = float(rows[-1]["request_seconds"]) + TICK_SECONDS
+    occupancy = Counter()
     for index, row in enumerate(rows):
         require(int(row["request_id"]) == index, f"{key}: missing, duplicate, or unordered request ID")
         check_number(row["detour_budget_ms"], float(run["detour_budget_ms"]), key)
-        workload.append(fields(row, ("request_seconds", "image", "access_point")))
+        workload.append(fields(row, ("request_seconds", "image", "access_point", "request_cpu_cores",
+                                     "request_model_memory", "service_lifetime_s")))
         bytes_pulled = int(row["downloaded_bytes"])
         download_bytes += bytes_pulled
         if not row["ready_seconds"]:
@@ -72,6 +76,9 @@ def verify_run(rows, run, count):
             continue
         latency = float(row["user_latency_ms"])
         startup = float(row["provisioning_seconds"])
+        arrival = float(row["request_seconds"])
+        ready_at = float(row["ready_seconds"])
+        release = ready_at + float(row["service_lifetime_s"])
         detour = float(row["detour_ms"])
         check_number(startup, float(row["ready_seconds"]) - float(row["request_seconds"]), key)
         check_number(detour, latency - float(row["nearest_feasible_ms"]), key)
@@ -80,6 +87,13 @@ def verify_run(rows, run, count):
         if run["policy"] == "nearest":
             check_number(detour, 0, key)
         violations += detour > float(run["detour_budget_ms"]) + 1e-9
+        for resource, demand, capacity in (
+            ("cpu", float(row["request_cpu_cores"]), float(run["total_cpu_cores"])),
+            ("memory", float(row["request_model_memory"]), float(run["total_model_memory"])),
+        ):
+            pool_fraction = 100 * demand / (capacity * window)
+            occupancy[f"{resource}_reserved_pct"] += (min(release, window) - arrival) * pool_fraction
+            occupancy[f"{resource}_ready_pct"] += max(0, min(release, window) - ready_at) * pool_fraction
         ready[index] = (startup, latency, detour)
     if run["policy"] == "guarded":
         require(violations == 0, f"{key}: {violations} guarded placements exceeded the configured cap")
@@ -89,6 +103,17 @@ def verify_run(rows, run, count):
     latency = [metrics[1] for metrics in ready.values()]
     detours = [metrics[2] for metrics in ready.values()]
     quartiles = quantiles(startup, n=4, method="inclusive") if len(startup) > 1 else None
+    deadlines = {key: 100 * sum(time <= seconds for time in startup) / count
+                 for key, seconds in zip(DEADLINE_METRICS, DEADLINES_SECONDS)}
+    for resource in ("cpu", "memory"):
+        reserved = occupancy[f"{resource}_reserved_pct"]
+        require(0 <= reserved <= 100 + 1e-9, f"{key}: reserved {resource} exceeds capacity")
+        for phase, value in (
+            ("reserved", reserved),
+            ("ready", occupancy[f"{resource}_ready_pct"]),
+            ("provisioning", reserved - occupancy[f"{resource}_ready_pct"]),
+        ):
+            check_number(run[f"{resource}_{phase}_pct"], value, f"{key}: {resource} {phase}")
     for metric, expected in {
         "requests": count, "ready": len(ready), "success_pct": success,
         "mean_provisioning_s": mean(startup) if ready else None,
@@ -103,17 +128,18 @@ def verify_run(rows, run, count):
         "max_detour_ms": max(detours, default=None),
         "over_budget_pct": 100 * violations / len(ready) if ready else None,
         "storage_rejections": rejected["storage"], "resource_rejections": rejected["cpu_or_memory"],
+        **deadlines,
     }.items():
         check_number(run[metric], expected, f"{key}: {metric}")
-    return workload, ready, download_mb, success
+    return workload, ready, download_mb, success, deadlines
 
 
 def verify_pair(pair, runs, key):
-    ready, download, success = runs[(pair["policy"], pair["weights"])]
+    ready, download, success, deadlines = runs[(pair["policy"], pair["weights"])]
     baseline_key = ("combined", "queue-blind") if pair["reference"] == "queue-blind" else (
         pair["reference"], "balanced",
     )
-    baseline, baseline_download, baseline_success = runs[baseline_key]
+    baseline, baseline_download, baseline_success, baseline_deadlines = runs[baseline_key]
     matched = sorted(ready.keys() & baseline.keys())
     left = [ready[index][1] for index in matched]
     right = [baseline[index][1] for index in matched]
@@ -124,6 +150,7 @@ def verify_pair(pair, runs, key):
         "matched_p95_latency_ms": tail(left) - tail(right) if matched else None,
         "download_mb_per_request": download - baseline_download,
         "success_pct": success - baseline_success,
+        **{key: deadlines[key] - baseline_deadlines[key] for key in DEADLINE_METRICS},
     }.items():
         check_number(pair[metric], expected, f"{key}: {pair['policy']} vs {pair['reference']}, {metric}")
 
@@ -153,11 +180,11 @@ def verify(directory):
                 rows = list(group)
                 request_total += len(rows)
                 run = remaining.pop(key + variant)
-                workload, ready, download, success = verify_run(rows, run, summary["requests_per_run"])
+                workload, ready, download, success, deadlines = verify_run(rows, run, summary["requests_per_run"])
                 if shared_workload is None:
                     shared_workload = workload
                 require(workload == shared_workload, f"{key}: policies received different request sequences")
-                scenario_runs[variant] = ready, download, success
+                scenario_runs[variant] = ready, download, success, deadlines
                 if variant[0] == "guarded":
                     ready_counts[variant[1]] += len(ready)
             require(all((policy, "balanced") in scenario_runs for policy in POLICIES),
@@ -167,14 +194,23 @@ def verify(directory):
     expected_keys = {tuple(cell.split("/")) + (str(seed),) for cell in summary["operating_regions"]
                      for seed in summary["seeds"]}
     require(not (remaining or pairs) and scenario_keys == expected_keys, "Missing runs, scenarios, or pairs")
+    require(len(summary["operating_regions"]) == summary["cells"], "Cell count mismatch")
     for policy in POLICIES:
         rows = [row for row in run_rows if row["policy"] == policy and row["weights"] == "balanced"]
         verify_intervals(summary["policies"][policy], rows, METRICS, policy)
+        for load, profile in summary["load_profile"].items():
+            at_load = [row for row in rows if row["load"] == load]
+            for metric, expected in profile[policy].items():
+                values = [float(row[metric]) for row in at_load if row[metric]]
+                check_number(expected["mean"], mean(values) if values else None, f"{policy} / {load}: {metric}")
     guarded_pairs = [row for row in pair_rows if row["policy"] == "guarded"]
-    sweep_cells = {fields(row, FACTORS) for row in guarded_pairs if row["weights"] != "balanced"}
+    sweep_cells = {fields(row, FACTORS) for row in guarded_pairs if row["weights"].startswith("detour-")}
     for reference, published in summary["guarded"]["paired"].items():
         rows = [row for row in guarded_pairs if row["weights"] == "balanced" and row["reference"] == reference]
         verify_intervals(published, rows, COMPARISON_METRICS, f"Guarded vs {reference}")
+    rows = [row for row in pair_rows if row["policy"] == "combined" and row["reference"] == "layer-queue"
+            and row["weights"] == "balanced"]
+    verify_intervals(summary["combined_vs_layer_queue"], rows, COMPARISON_METRICS, "Combined vs Layer + Queue")
     for variant, result in summary["guarded"]["by_budget"].items():
         check_number(result["ready_placements"], ready_counts[variant], variant)
         rows = [row for row in run_rows if row["policy"] == "guarded" and row["weights"] == variant]

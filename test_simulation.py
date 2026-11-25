@@ -2,10 +2,10 @@ import unittest
 from dataclasses import replace
 from random import Random
 
-from experiment import operating_region, p95, paired_difference
+from experiment import operating_region, p95, paired_difference, resource_occupancy, summary
 from policies import Candidate, Guardrails, POLICIES, WEIGHTS, adaptive_layer_score, choose
 from scenarios import MB, demo_scenario, generate
-from simulation import simulate
+from simulation import Outcome, simulate
 
 
 class ProvisioningTests(unittest.TestCase):
@@ -120,6 +120,31 @@ class ProvisioningTests(unittest.TestCase):
         self.assertEqual(p95(range(1, 21)), 19)
         self.assertEqual(p95([2]), 2)
         self.assertIsNone(p95([]))
+
+    def test_queue_aware_layer_baseline_ranks_by_pull_time_only(self):
+        cached = Candidate("cached", MB, MB, 8, 2, 0.1)
+        fast = Candidate("fast", 2 * MB, 2 * MB, 2, 25, 0.9)
+        self.assertEqual(choose("layer-aware", [cached, fast], Random(1), WEIGHTS["balanced"]), cached)
+        self.assertEqual(choose("layer-queue", [cached, fast], Random(1), WEIGHTS["balanced"]), fast)
+
+    def test_deadline_readiness_counts_late_and_rejected_requests_as_misses(self):
+        ready = Outcome(0, 0, "image", "site", ready_seconds=15, provisioning_seconds=15,
+                        user_latency_ms=5, detour_ms=0, missing_bytes=1)
+        rejected = Outcome(1, 0, "image", "site", rejection="cpu_or_memory")
+        metrics = summary([ready, rejected], 0, 8)
+        self.assertEqual(metrics["ready_by_10s_pct"], 0)
+        self.assertEqual(metrics["ready_by_30s_pct"], 50)
+        self.assertEqual(metrics["success_pct"], 50)
+
+    def test_resource_occupancy_clips_both_phases_to_arrival_window(self):
+        request, rejected = demo_scenario().requests[:2]
+        request = replace(request, cpu=2, memory=4, lifetime_ticks=2)
+        rejected = replace(rejected, arrival_tick=3)
+        ready = Outcome(0, 0, "demo", "near", ready_seconds=0.25, provisioning_seconds=0.25)
+        denied = Outcome(1, 0.75, "demo", "near", rejection="storage")
+        result = resource_occupancy((request, rejected), (ready, denied), cpu_capacity=4, memory_capacity=8)
+        self.assertEqual([result[key] for key in ("cpu_reserved_pct", "cpu_provisioning_pct", "cpu_ready_pct")],
+                         [37.5, 12.5, 25.0])
 
 
 if __name__ == "__main__":

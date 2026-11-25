@@ -3,18 +3,23 @@
 from dataclasses import dataclass
 from math import isfinite
 
-POLICIES = ("random", "first-fit", "best-fit", "layer-aware", "adaptive-layer", "nearest",
+POLICIES = ("random", "first-fit", "best-fit", "layer-aware", "layer-queue", "adaptive-layer", "nearest",
             "combined", "guarded")
+PULL_SCALE_SECONDS = 4.0
+PATH_SCALE_MS = 20.0
 WEIGHTS = {
     "balanced": (0.55, 0.25, 0.20),
     "pull-heavy": (0.75, 0.15, 0.10),
     "latency-heavy": (0.25, 0.60, 0.15),
+    "resource-heavy": (0.25, 0.15, 0.60),
+    "equal-weight": (1 / 3, 1 / 3, 1 / 3),
 }
 LABELS = {
     "random": "Random Feasible",
     "first-fit": "First-Fit",
     "best-fit": "Resource Best-Fit",
     "layer-aware": "Layer-Aware Greedy",
+    "layer-queue": "Layer-Aware + Queue",
     "adaptive-layer": "LRScheduler-inspired",
     "nearest": "Nearest Feasible",
     "combined": "Combined",
@@ -67,6 +72,8 @@ def choose(policy, candidates, rng, weights, guardrails=Guardrails()):
         return max(candidates, key=lambda candidate: candidate.resource_pressure)
     if policy == "layer-aware":
         return min(candidates, key=lambda candidate: candidate.missing_bytes)
+    if policy == "layer-queue":
+        return min(candidates, key=lambda candidate: candidate.pull_seconds)
     if policy == "adaptive-layer":
         return max(candidates, key=adaptive_layer_score)
     if policy in ("nearest", "guarded"):
@@ -86,8 +93,8 @@ def choose(policy, candidates, rng, weights, guardrails=Guardrails()):
         return min(
             candidates,
             key=lambda candidate: (
-                pull * candidate.pull_seconds / 4
-                + latency * candidate.latency_ms / 20
+                pull * candidate.pull_seconds / PULL_SCALE_SECONDS
+                + latency * candidate.latency_ms / PATH_SCALE_MS
                 + resources * candidate.resource_pressure
             ),
         )
