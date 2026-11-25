@@ -1,0 +1,20 @@
+{
+  "requests_per_run": 100,
+  "seed_start": 101,
+  "seed_count": 12,
+  "cache_fractions": {"cold": 0.0, "partial": 0.45, "warm": 0.90},
+  "load_multipliers": {"light": 0.55, "moderate": 0.95, "heavy": 1.45},
+  "backhaul_mbps": {"limited": 35, "fast": 160},
+  "guardrails": {"max_detour_ms": 8.0, "min_pull_gain_s": 0.25},
+  "guard_sensitivity_ms": [0, 4, 12, 24],
+  "operating_limits": {
+    "min_provisioning_gain_s": 0.25,
+    "max_user_latency_cost_ms": 2.0,
+    "max_success_cost_pp": 2.0
+  },
+  "weight_sensitivity": [
+    ["cold", "heavy", "limited"],
+    ["partial", "moderate", "limited"],
+    ["warm", "moderate", "fast"]
+  ]
+}
